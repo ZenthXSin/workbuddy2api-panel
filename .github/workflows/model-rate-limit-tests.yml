@@ -1,0 +1,33 @@
+name: model-rate-limit-tests
+
+on:
+  push:
+    branches: ["codex/fix-model-rate-limit-20261107"]
+  pull_request:
+    paths:
+      - "internal/pool/**"
+      - "internal/server/**"
+      - "internal/upstream/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/model-rate-limit-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: test -z "$(gofmt -l internal/pool/cooldown.go internal/pool/modelblocked_rate_test.go internal/server/handler.go internal/server/model_cooldown_response_test.go)"
+      - name: Model cooldown regression tests
+        run: go test -count=1 -v ./internal/pool ./internal/server
+      - name: Full regression suite
+        run: go test ./...
