@@ -370,6 +370,8 @@ type ModelBlockStatus struct {
 	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// 6004 是可重试的限流；不能因同池另一个账号的 11102/11158 报成模型不可用。
+	RateLimitedCount int
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
@@ -423,6 +425,9 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 			// 取最早解封：那才是"再等多久值得重试"的答案。
 			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
 				st.Until = mc.Until
+			}
+			if mc.Reason == "6004" || strings.HasPrefix(mc.Reason, "6004 ") {
+				st.RateLimitedCount++
 			}
 		}
 	}

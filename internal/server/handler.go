@@ -1272,33 +1272,56 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			upstreamMsgPassed = true
 		}
 	}
-	// 模型级阻塞覆盖上面的通用文案（放在最后 = 优先级最高）。
-	//
-	// 为什么能覆盖 code 而不丢信息：modelBlock.Reason 就是 BlockModelBackoff 存下的
-	// 上游原因，已在 hint 里原样带出，所以覆盖 message 不会丢掉上游信息，反而补上
-	// 了上游不会告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。
-	//
-	// 用 400 而非 503：这是"你选的这个模型当前不可用"，不是"服务端暂时过载"。
-	// 换号重试必然同样失败，客户端不该按可重试错误处理。
+	// MaxRotate 恰好耗尽时不会再进入选号失败分支，也要读取刚写入的模型冷却。
+	if !modelBlock.Blocked && ue != nil && (ue.Kind == upstream.ErrSoftRate || ue.Kind == upstream.ErrModelBlocked) {
+		modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
+	}
+	// 6004 限流与 11102/11158 模型拒绝共用冷却表，响应语义必须区分。
+	// 混合池仍有因 6004 暂时不可选的账号时，按最早解除的本地 Until 提示重试。
 	if modelBlock.Blocked {
-		code = "model_unavailable"
-		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号
-		// 被挡、最早何时解封"这类本地调度信息放进 gateway_hint。
-		if !upstreamMsgPassed {
-			msg = "model is unavailable on every account (per-model cooldown), try another model"
+		if modelBlock.RateLimitedCount > 0 {
+			status = http.StatusTooManyRequests
+			code = "rate_limit_exceeded"
+			if !upstreamMsgPassed {
+				msg = "rate limited: accounts are cooling down this model, retry after the local cooldown"
+			}
+			hint = fmt.Sprintf("model_rate_limited: %d of %d account(s) cooling down this model due to 6004", modelBlock.RateLimitedCount, modelBlock.Count)
+			if !modelBlock.Until.IsZero() {
+				hint += "; earliest local retry at " + modelBlock.Until.Format(time.RFC3339Nano)
+				w.Header().Set("Retry-After", fmt.Sprint(retryAfterSeconds(modelBlock.Until, time.Now())))
+			}
+		} else {
+			status = http.StatusBadRequest
+			code = "model_unavailable"
+			// 首次上游原文保持透传；后续负缓存拒绝才使用本地文案。
+			if !upstreamMsgPassed {
+				msg = "model is unavailable on every account (per-model cooldown), try another model"
+			}
+			hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
+			if !modelBlock.Until.IsZero() {
+				hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
+			}
+			if s := strings.TrimSpace(modelBlock.Reason); s != "" {
+				hint += "; upstream: " + s
+			}
 		}
-		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", modelBlock.Count)
-		if !modelBlock.Until.IsZero() {
-			hint += "; earliest unblock at " + modelBlock.Until.Format(time.RFC3339)
-		}
-		if s := strings.TrimSpace(modelBlock.Reason); s != "" {
-			hint += "; upstream: " + s
-		}
-		status = http.StatusBadRequest
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status
 	st.outcome = reqlog.OutcomeHTTPError
+}
+
+// Retry-After 使用向上取整的秒数，避免小数秒截断导致客户端在本地冷却到期前重试。
+func retryAfterSeconds(until, now time.Time) int64 {
+	remaining := until.Sub(now)
+	seconds := int64(remaining / time.Second)
+	if remaining%time.Second > 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
